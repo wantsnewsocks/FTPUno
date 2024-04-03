@@ -11,7 +11,7 @@ twisted
 The script and dependancies can be installed using the following command:
 
 ```python
-
+pip3 install -r ./requirements.txt
 ```
 
 ## Usage

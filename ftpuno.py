@@ -1,7 +1,11 @@
 import argparse
 import time
+import os
+import subprocess
 from enum import Enum
-from twisted.internet import reactor, interfaces, protocol, error, defer
+from twisted.internet import reactor, interfaces, protocol, error, defer, ssl
+from twisted.web.server import Site
+from twisted.web.static import File
 from twisted.cred.portal import Portal
 from twisted.protocols import basic
 from twisted.protocols.ftp import FTPFactory, FTP, FTPRealm
@@ -9,12 +13,36 @@ from twisted.protocols.ftp import ENTERING_PASV_MODE, CMD_NOT_IMPLMNTD, DATA_CNX
 from twisted.cred.checkers import AllowAnonymousAccess
 from twisted.web import proxy, http
 
+def parse_certificate_files(args):
+    # Check if the certificate and key already exist
+    if not os.path.exists(args.cert_file) or not os.path.exists(args.key_file):
+        print("Certificate or key file not found. Generating new ones...")
+
+        # Define the OpenSSL command to generate a self-signed certificate
+        openssl_command = [
+            "openssl", "req", "-x509", "-newkey", "rsa:4096",
+            "-keyout", args.key_file, "-out", args.cert_file, "-days", "365", "-nodes",
+            "-subj", "/C=IO/ST=IO/L=IO/O=FTPUno/CN=ftpuno.com"
+        ]
+
+        try:
+            # Run the OpenSSL command
+            subprocess.run(openssl_command, check=True)
+            print(f"Successfully generated {args.cert_file} and {args.key_file}.")
+        except subprocess.CalledProcessError as e:
+            print(f"Error during OpenSSL execution: {e}")
+    else:
+        print("Certificate and key already exist. No need to generate new ones.")
+
 def main(args):
+    # Setup and parse certs
+    parse_certificate_files(args)
+
     # Create Twisted Portal
     portal = Portal(FTPRealm(args.ftpdir), [AllowAnonymousAccess()])
 
     # Run both servers on the same port
-    reactor.listenTCP(int(args.uno), UnoProxyFactory(args.ftptimeout, portal, int(args.uno)))
+    reactor.listenTCP(int(args.uno), UnoProxyFactory(args.ftptimeout, portal, int(args.uno), args.dtddir, args.cert_file, args.key_file))
     reactor.run()   
 
 # Internal exception used to signify an error during parsing a path.
@@ -269,20 +297,65 @@ class UnoProxyProtocol(basic.LineReceiver):
             self.factory.pass_connection_to_ftp_factory(self.transport)
             client_connection['Control']=True
 
-    def rawDataReceived(self, data):
-        # Forward the FTP request to another FTP server  
+    def rawDataReceived(self, data):        
         self.stopTimeout()      
         print(f"raw data receiv: \n {data}")
 
+        # Handle incoming data
+        if data.startswith(b'\x16\x03'):
+            print("TLS/SSL detected")
+            ssl_flag=True
+        else:
+            print("Not a TLS/SSL connection")
+            ssl_flag=False
+
+        print(f"Transfering HTTP request")
+        self.factory.pass_connection_to_http_factory(self.transport,data, ssl_flag) 
+
+# SSL Wrapping Protocol
+# class SSLWrappingProtocol(WrappingProtocol):
+#     def __init__(self, contextFactory):
+#         self.contextFactory = contextFactory
+
+#     def connectionMade(self):
+#         # If the transport isn't already using SSL, wrap it
+#         if not isinstance(self.transport, ssl.SSLServerTransport):            
+#             self.transport = ssl.SSLServerTransport(self.transport, self.contextFactory.getContext(), False, self)
+#         super().connectionMade()
+
+class SSLWrappingProtocol(protocol.Protocol):
+    def __init__(self, transport, contextFactory):
+        self.transport = transport
+        self.contextFactory = contextFactory
+
+    def connectionMade(self):
+        # Wrap the transport with SSL using the context factory
+        self.sslContext = self.contextFactory.getContext()
+        self.transport = ssl.SSLTransport(self.transport, self.sslContext, False, self)
+        self.transport.protocol = self
+        self.transport.startTLS(self.sslContext)
+
+    def dataReceived(self, data):
+        # Handle incoming data
+        print(f"Received data: {data}")
 
 # TCP Proxy Server
 class UnoProxyFactory(protocol.Factory):
-    def __init__(self,timeout, portal, dataport):
+    def __init__(self,timeout, portal, dataport, rootdir, certfile, keyfile):
         self.uno_connections={}
         self.ftp_timeout_duration = timeout
-        self.http_factory = HTTPProxyFactory()
+        self.rootdir = rootdir
+        self.http_factory = self.createHTTPSiteFactory()
+        self.http_factory_running = False
         self.ftp_factory = XXEFTPFactory(portal, dataport, self)
+        self.ftp_factory_running = False
         self.ftp_data_factory = FTPDataFactory()
+        self.ftp_data_factory_running = False
+        self.ssl_context = ssl.DefaultOpenSSLContextFactory(keyfile, certfile)
+
+    def createHTTPSiteFactory(self):
+        rootFs = File(self.rootdir)
+        return Site(rootFs)
 
     def buildProtocol(self, addr):
         print(f"Incoming UNO Connection: {addr}")
@@ -300,17 +373,63 @@ class UnoProxyFactory(protocol.Factory):
 
     def pass_connection_to_ftp_factory(self, transport):
         print(f"Passing Uno Connection {transport.getPeer().host}:{transport.getPeer().port} to FTP Control Channel")
-        self.ftp_factory.startFactory()
+                
+        if not self.ftp_factory_running:
+            self.ftp_factory.startFactory()
+            self.ftp_factory_running=True        
+        
         ftp_protocol = self.ftp_factory.buildProtocol(None)
+        if ftp_protocol is None:
+            # Handle case where the factory may not return a protocol
+            print("Failed to create FTP protocol.")
+            transport.loseConnection()
+            return
+
         transport.protocol = ftp_protocol
         ftp_protocol.makeConnection(transport)
 
     def pass_connection_to_ftp_data_factory(self, transport):
         print(f"Passing Uno Connection {transport.getPeer().host}:{transport.getPeer().port} to FTP Data Channel")
-        self.ftp_data_factory.startFactory()
+                
+        if not self.ftp_data_factory_running:
+            self.ftp_data_factory.startFactory()
+            self.ftp_data_factory_running=True 
+        
         ftp_protocol = self.ftp_data_factory.buildProtocol(None)
         transport.protocol = ftp_protocol
         ftp_protocol.makeConnection(transport)
+
+    def pass_connection_to_http_factory(self, transport, initial_data, is_https):        
+        print(f"Passing Connection {transport.getPeer().host}:{transport.getPeer().port} to HTTP Server")
+        
+        # Ensure the HTTP factory is started once (not repeatedly)
+        if not self.http_factory_running:
+            self.http_factory.startFactory()
+            self.http_factory_running=True
+
+        # Setup the HTTP Protocol
+        http_protocol = self.http_factory.buildProtocol(None)
+        if http_protocol is None:
+            # Handle case where the factory may not return a protocol
+            print("Failed to create HTTP protocol.")
+            transport.loseConnection()
+            return
+        
+        # Check if the connection is HTTPS, if so, wrap it in SSL
+        if is_https:
+            print("Wrapping connection in SSL...")
+            # Set up the SSL context and wrap the transport            
+            ssl_transport = ssl.SSLServerTransport(transport, self.sslContextFactory.getContext(), False, http_protocol)
+            http_protocol.makeConnection(ssl_transport)
+        else:
+            print("Handling plain HTTP...")                    
+            transport.protocol = http_protocol
+            http_protocol.makeConnection(transport)        
+
+        # Manually pass any initial data if needed (e.g., the HTTP request data may already be partially received)        
+        if initial_data:
+            http_protocol.dataReceived(initial_data)
+
 
 
 if __name__ == '__main__':
@@ -342,6 +461,14 @@ if __name__ == '__main__':
                         help='FTP timeout (default 3s)',
                         required=False,
                         default=3) 
+    parser.add_argument('--cert_file',                        
+                        help='HTTPs public cert file',
+                        required=False,
+                        default="./cert.pem") 
+    parser.add_argument('--key_file',
+                        help='HTTPs private key file',
+                        required=False,
+                        default="./key.pem") 
     
     args=parser.parse_args()
     if not args.outfile:

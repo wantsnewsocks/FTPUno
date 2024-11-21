@@ -42,7 +42,13 @@ def main(args):
     portal = Portal(FTPRealm(args.ftpdir), [AllowAnonymousAccess()])
 
     # Run both servers on the same port
-    reactor.listenTCP(int(args.uno), UnoProxyFactory(args.ftptimeout, portal, int(args.uno), args.dtddir, args.cert_file, args.key_file))
+    reactor.listenTCP(int(args.uno), UnoProxyFactory(args, portal))
+
+    # Create SSL server
+    ssl_context = ssl.DefaultOpenSSLContextFactory(args.key_file, args.cert_file)
+    rootFs = File(args.dtddir)
+    secure_factory = Site(rootFs)
+    reactor.listenSSL(int(args.httpsport), secure_factory, ssl_context)
     reactor.run()   
 
 # Internal exception used to signify an error during parsing a path.
@@ -259,7 +265,7 @@ class UnoProxyProtocol(basic.LineReceiver):
     def __init__(self, factory):        
         self.factory = factory
         self.timeout_task = None
-        self.ftp_timeout_duration = factory.ftp_timeout_duration
+        self.ftp_timeout_duration = factory.argsObj.ftptimeout
         print('Setting raw data mode')
         self.setRawMode()
     
@@ -312,49 +318,32 @@ class UnoProxyProtocol(basic.LineReceiver):
         print(f"Transfering HTTP request")
         self.factory.pass_connection_to_http_factory(self.transport,data, ssl_flag) 
 
-# SSL Wrapping Protocol
-# class SSLWrappingProtocol(WrappingProtocol):
-#     def __init__(self, contextFactory):
-#         self.contextFactory = contextFactory
+# SSL Proxy
+class SecureProxyClientFactory(protocol.ClientFactory):
+    def __init__(self, original_transport, initial_data):
+        self.original_transport = original_transport
+        self.initial_data = initial_data
 
-#     def connectionMade(self):
-#         # If the transport isn't already using SSL, wrap it
-#         if not isinstance(self.transport, ssl.SSLServerTransport):            
-#             self.transport = ssl.SSLServerTransport(self.transport, self.contextFactory.getContext(), False, self)
-#         super().connectionMade()
-
-class SSLWrappingProtocol(protocol.Protocol):
-    def __init__(self, transport, contextFactory):
-        self.transport = transport
-        self.contextFactory = contextFactory
-
-    def connectionMade(self):
-        # Wrap the transport with SSL using the context factory
-        self.sslContext = self.contextFactory.getContext()
-        self.transport = ssl.SSLTransport(self.transport, self.sslContext, False, self)
-        self.transport.protocol = self
-        self.transport.startTLS(self.sslContext)
-
-    def dataReceived(self, data):
-        # Handle incoming data
-        print(f"Received data: {data}")
+    def buildProtocol(self, addr):
+        p = protocol.Protocol()
+        p.transport = self.original_transport
+        p.dataReceived(self.initial_data)
+        return p
 
 # TCP Proxy Server
 class UnoProxyFactory(protocol.Factory):
-    def __init__(self,timeout, portal, dataport, rootdir, certfile, keyfile):
+    def __init__(self, argsObj, portal):
         self.uno_connections={}
-        self.ftp_timeout_duration = timeout
-        self.rootdir = rootdir
+        self.argsObj = argsObj
         self.http_factory = self.createHTTPSiteFactory()
         self.http_factory_running = False
-        self.ftp_factory = XXEFTPFactory(portal, dataport, self)
+        self.ftp_factory = XXEFTPFactory(portal, int(argsObj.uno), self)
         self.ftp_factory_running = False
         self.ftp_data_factory = FTPDataFactory()
-        self.ftp_data_factory_running = False
-        self.ssl_context = ssl.DefaultOpenSSLContextFactory(keyfile, certfile)
+        self.ftp_data_factory_running = False                     
 
     def createHTTPSiteFactory(self):
-        rootFs = File(self.rootdir)
+        rootFs = File(self.argsObj.dtddir)
         return Site(rootFs)
 
     def buildProtocol(self, addr):
@@ -415,12 +404,18 @@ class UnoProxyFactory(protocol.Factory):
             transport.loseConnection()
             return
         
-        # Check if the connection is HTTPS, if so, wrap it in SSL
+        # Check if the connection is HTTPS, if so, proxy it to the SSL Server
         if is_https:
-            print("Wrapping connection in SSL...")
-            # Set up the SSL context and wrap the transport            
-            ssl_transport = ssl.SSLServerTransport(transport, self.sslContextFactory.getContext(), False, http_protocol)
-            http_protocol.makeConnection(ssl_transport)
+            print(f"Proxying connection to SSL Server on port {self.argsObj.httpsport}...")
+            # Forward the connection to an HTTPS listener
+            transport.loseConnection()
+
+            # Use Twisted's connectSSL to proxy the connection to the actual HTTPS server            
+            ssl_context = ssl.optionsForClientTLS(hostname="localhost")
+
+            https_factory = SecureProxyClientFactory(transport, initial_data)
+            reactor.connectSSL("localhost", self.argsObj.httpsport, https_factory, ssl_context)
+
         else:
             print("Handling plain HTTP...")                    
             transport.protocol = http_protocol
@@ -440,8 +435,9 @@ if __name__ == '__main__':
                         help='path to the target output file',
                         default='./output.txt',
                         required=False) 
-    parser.add_argument('--ftpport',
-                        help='FTP Port to listen on (default 2121)')                        
+    parser.add_argument('--httpsport',
+                        default=8443,
+                        help='HTTPS Port to listen on (default 8443)')                        
     parser.add_argument('-u',
                         '--uno',
                         default='5000',
@@ -451,7 +447,7 @@ if __name__ == '__main__':
                         '--dtddir',
                         help='Folder to server DTD(s) from (default "./")',
                         required=False,
-                        default="./") 
+                        default="./dtds") 
     parser.add_argument('-fd',
                         '--ftpdir',
                         help='Folder to server FTP from (default "./")',
